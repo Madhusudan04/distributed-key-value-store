@@ -1,6 +1,7 @@
 package com.kvstore.server;
 
 import com.kvstore.cache.LRUCache;
+import com.kvstore.persistence.AOFWriter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -26,6 +27,7 @@ public class KVStoreServer {
     private final int port;
     private final int threadPoolSize;
     private final LRUCache<String, String> cache;
+    private final AOFWriter aofWriter;
 
     private ServerSocket serverSocket;
     private ExecutorService executorService;
@@ -35,10 +37,12 @@ public class KVStoreServer {
     public KVStoreServer(
             @Value("${kvstore.server.port:6379}") int port,
             @Value("${kvstore.server.thread-pool-size:10}") int threadPoolSize,
-            LRUCache<String, String> cache) {
+            LRUCache<String, String> cache,
+            AOFWriter aofWriter) {
         this.port = port;
         this.threadPoolSize = threadPoolSize;
         this.cache = cache;
+        this.aofWriter = aofWriter;
     }
 
     /**
@@ -73,12 +77,12 @@ public class KVStoreServer {
         while (running && !Thread.currentThread().isInterrupted()) {
             try {
                 Socket clientSocket = serverSocket.accept();
-                log.debug("New client connection from {}:{}", 
-                         clientSocket.getInetAddress().getHostAddress(),
-                         clientSocket.getPort());
+                log.debug("New client connection from {}:{}",
+                        clientSocket.getInetAddress().getHostAddress(),
+                        clientSocket.getPort());
 
                 // Handle client in thread pool
-                ConnectionHandler handler = new ConnectionHandler(clientSocket, cache);
+                ConnectionHandler handler = new ConnectionHandler(clientSocket, cache, aofWriter);
                 executorService.submit(handler);
 
             } catch (IOException e) {
