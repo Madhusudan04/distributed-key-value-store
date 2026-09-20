@@ -1,6 +1,7 @@
 package com.kvstore.server;
 
 import com.kvstore.cache.LRUCache;
+import com.kvstore.persistence.AOFWriter;
 import com.kvstore.protocol.*;
 import lombok.extern.slf4j.Slf4j;
 
@@ -11,17 +12,20 @@ import java.net.Socket;
  * Handles a single client connection.
  * Runs in a separate thread from the ThreadPool.
  * Reads requests, executes commands, and sends responses.
+ * Writes all write operations to AOF for durability.
  */
 @Slf4j
 public class ConnectionHandler implements Runnable {
 
     private final Socket socket;
     private final LRUCache<String, String> cache;
+    private final AOFWriter aofWriter;
     private volatile boolean running = true;
 
-    public ConnectionHandler(Socket socket, LRUCache<String, String> cache) {
+    public ConnectionHandler(Socket socket, LRUCache<String, String> cache, AOFWriter aofWriter) {
         this.socket = socket;
         this.cache = cache;
+        this.aofWriter = aofWriter;
     }
 
     @Override
@@ -79,8 +83,8 @@ public class ConnectionHandler implements Runnable {
                     // Decode and process request
                     try {
                         Request request = RequestDecoder.decode(requestData);
-                        log.debug("Received command {} with {} args from {}:{}", 
-                                 request.getCommand(), request.getArgCount(), clientAddress, clientPort);
+                        log.debug("Received command {} with {} args from {}:{}",
+                                request.getCommand(), request.getArgCount(), clientAddress, clientPort);
 
                         Response response = processCommand(request);
 
@@ -92,8 +96,8 @@ public class ConnectionHandler implements Runnable {
                         out.write(responseData);
                         out.flush();
 
-                        log.debug("Sent response with status {} to {}:{}", 
-                                 response.getStatus(), clientAddress, clientPort);
+                        log.debug("Sent response with status {} to {}:{}",
+                                response.getStatus(), clientAddress, clientPort);
 
                     } catch (IOException e) {
                         log.error("Error processing request from {}:{}", clientAddress, clientPort, e);
@@ -173,6 +177,10 @@ public class ConnectionHandler implements Runnable {
 
         try {
             cache.put(key, value, expirySeconds);
+
+            // ← ADDED: Write to AOF
+            aofWriter.writeSet(key, value, expirySeconds);
+
             log.debug("SET {} = {} (expiry: {} seconds)", key, value, expirySeconds);
             return Response.ok();
         } catch (Exception e) {
@@ -215,6 +223,12 @@ public class ConnectionHandler implements Runnable {
 
         try {
             boolean deleted = cache.delete(key);
+
+            // ← ADDED: Write to AOF only if key was deleted
+            if (deleted) {
+                aofWriter.writeDel(key);
+            }
+
             log.debug("DEL {} = {}", key, deleted ? 1 : 0);
             return Response.integer(deleted ? 1 : 0);
         } catch (Exception e) {
@@ -260,6 +274,12 @@ public class ConnectionHandler implements Runnable {
 
         try {
             boolean success = cache.expire(key, seconds);
+
+            // ← ADDED: Write to AOF only if expire was successful
+            if (success) {
+                aofWriter.writeExpire(key, seconds);
+            }
+
             log.debug("EXPIRE {} {} = {}", key, seconds, success ? 1 : 0);
             return Response.integer(success ? 1 : 0);
         } catch (Exception e) {
@@ -305,13 +325,15 @@ public class ConnectionHandler implements Runnable {
     private Response handleInfo(Request request) {
         try {
             String info = String.format(
-                "# KV Store Info\r\n" +
-                "cache_size=%d\r\n" +
-                "cache_capacity=%d\r\n" +
-                "timestamp=%d\r\n",
-                cache.size(),
-                cache.getCapacity(),
-                System.currentTimeMillis()
+                    "# KV Store Info\r\n" +
+                            "cache_size=%d\r\n" +
+                            "cache_capacity=%d\r\n" +
+                            "aof_file_size=%d\r\n" +
+                            "timestamp=%d\r\n",
+                    cache.size(),
+                    cache.getCapacity(),
+                    aofWriter.getFileSize(),
+                    System.currentTimeMillis()
             );
             log.debug("INFO command executed");
             return Response.bulkString(info);
@@ -342,10 +364,10 @@ public class ConnectionHandler implements Runnable {
      */
     private byte[] writeInt(int value) {
         return new byte[]{
-            (byte) ((value >> 24) & 0xFF),
-            (byte) ((value >> 16) & 0xFF),
-            (byte) ((value >> 8) & 0xFF),
-            (byte) (value & 0xFF)
+                (byte) ((value >> 24) & 0xFF),
+                (byte) ((value >> 16) & 0xFF),
+                (byte) ((value >> 8) & 0xFF),
+                (byte) (value & 0xFF)
         };
     }
 
@@ -354,9 +376,9 @@ public class ConnectionHandler implements Runnable {
      */
     private int readInt(byte[] bytes) {
         return ((bytes[0] & 0xFF) << 24) |
-               ((bytes[1] & 0xFF) << 16) |
-               ((bytes[2] & 0xFF) << 8) |
-               (bytes[3] & 0xFF);
+                ((bytes[1] & 0xFF) << 16) |
+                ((bytes[2] & 0xFF) << 8) |
+                (bytes[3] & 0xFF);
     }
 
     /**
