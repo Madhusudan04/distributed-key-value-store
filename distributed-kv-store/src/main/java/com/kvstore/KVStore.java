@@ -4,10 +4,10 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
 @SpringBootApplication
-public class DistributedKvStoreApplication {
+public class KVStore {
 
 	public static void main(String[] args) {
-		SpringApplication.run(DistributedKvStoreApplication.class, args);
+		SpringApplication.run(KVStore.class, args);
 	}
 
 }
