@@ -1,6 +1,7 @@
 package com.kvstore.server;
 
 import com.kvstore.cache.LRUCache;
+import com.kvstore.cluster.ReplicationManager;
 import com.kvstore.persistence.AOFWriter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -19,6 +20,7 @@ import java.util.concurrent.TimeUnit;
  * TCP Server for KV Store.
  * Listens on a specified port and accepts client connections.
  * Uses a thread pool to handle multiple clients concurrently.
+ * Integrates with cluster replication manager.
  */
 @Slf4j
 @Component
@@ -28,6 +30,7 @@ public class KVStoreServer {
     private final int threadPoolSize;
     private final LRUCache<String, String> cache;
     private final AOFWriter aofWriter;
+    private final ReplicationManager replicationManager;
 
     private ServerSocket serverSocket;
     private ExecutorService executorService;
@@ -38,11 +41,13 @@ public class KVStoreServer {
             @Value("${kvstore.server.port:6379}") int port,
             @Value("${kvstore.server.thread-pool-size:10}") int threadPoolSize,
             LRUCache<String, String> cache,
-            AOFWriter aofWriter) {
+            AOFWriter aofWriter,
+            ReplicationManager replicationManager) {
         this.port = port;
         this.threadPoolSize = threadPoolSize;
         this.cache = cache;
         this.aofWriter = aofWriter;
+        this.replicationManager = replicationManager;
     }
 
     /**
@@ -82,7 +87,7 @@ public class KVStoreServer {
                         clientSocket.getPort());
 
                 // Handle client in thread pool
-                ConnectionHandler handler = new ConnectionHandler(clientSocket, cache, aofWriter);
+                ConnectionHandler handler = new ConnectionHandler(clientSocket, cache, aofWriter, replicationManager);
                 executorService.submit(handler);
 
             } catch (IOException e) {
