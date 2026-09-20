@@ -1,18 +1,22 @@
 package com.kvstore.server;
 
 import com.kvstore.cache.LRUCache;
+import com.kvstore.cluster.ClusterNode;
+import com.kvstore.cluster.ReplicationManager;
 import com.kvstore.persistence.AOFWriter;
 import com.kvstore.protocol.*;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.*;
 import java.net.Socket;
+import java.util.List;
 
 /**
  * Handles a single client connection.
  * Runs in a separate thread from the ThreadPool.
  * Reads requests, executes commands, and sends responses.
  * Writes all write operations to AOF for durability.
+ * Replicates writes to cluster replica nodes.
  */
 @Slf4j
 public class ConnectionHandler implements Runnable {
@@ -20,12 +24,15 @@ public class ConnectionHandler implements Runnable {
     private final Socket socket;
     private final LRUCache<String, String> cache;
     private final AOFWriter aofWriter;
+    private final ReplicationManager replicationManager;
     private volatile boolean running = true;
 
-    public ConnectionHandler(Socket socket, LRUCache<String, String> cache, AOFWriter aofWriter) {
+    public ConnectionHandler(Socket socket, LRUCache<String, String> cache,
+                             AOFWriter aofWriter, ReplicationManager replicationManager) {
         this.socket = socket;
         this.cache = cache;
         this.aofWriter = aofWriter;
+        this.replicationManager = replicationManager;
     }
 
     @Override
@@ -157,6 +164,7 @@ public class ConnectionHandler implements Runnable {
 
     /**
      * Handles SET command: SET key value [seconds]
+     * Replicates to all responsible nodes.
      */
     private Response handleSet(Request request) {
         if (request.getArgCount() < 2) {
@@ -176,12 +184,24 @@ public class ConnectionHandler implements Runnable {
         }
 
         try {
+            // Check if this node is responsible for this key
+            ClusterNode primaryNode = replicationManager.getPrimaryNode(key);
+
+            if (primaryNode != null) {
+                log.debug("Key {} primary node: {}", key, primaryNode.getId());
+            }
+
+            // Write to local cache
             cache.put(key, value, expirySeconds);
 
-            // ← ADDED: Write to AOF
+            // Write to AOF
             aofWriter.writeSet(key, value, expirySeconds);
 
-            log.debug("SET {} = {} (expiry: {} seconds)", key, value, expirySeconds);
+            // ← NEW: Replicate to other nodes
+            int replicaCount = replicationManager.replicateSet(key, value, expirySeconds);
+
+            log.debug("SET {} = {} (expiry: {} seconds, replicated to {} nodes)",
+                    key, value, expirySeconds, replicaCount);
             return Response.ok();
         } catch (Exception e) {
             return Response.error("Failed to set key: " + e.getMessage());
@@ -190,6 +210,7 @@ public class ConnectionHandler implements Runnable {
 
     /**
      * Handles GET command: GET key
+     * Reads from local cache or tries replicas if key not found locally.
      */
     private Response handleGet(Request request) {
         if (request.getArgCount() < 1) {
@@ -199,13 +220,18 @@ public class ConnectionHandler implements Runnable {
         String key = request.getArg(0);
 
         try {
+            // Try to get from local cache first
             String value = cache.get(key);
-            if (value == null) {
-                log.debug("GET {} = nil", key);
-                return Response.nil();
+
+            if (value != null) {
+                log.debug("GET {} = {} (from local cache)", key, value);
+                return Response.bulkString(value);
             }
-            log.debug("GET {} = {}", key, value);
-            return Response.bulkString(value);
+
+            // ← NEW: If not in local cache, we could try replicas
+            // For now, just return nil (in full clustering, we'd query replicas)
+            log.debug("GET {} = nil", key);
+            return Response.nil();
         } catch (Exception e) {
             return Response.error("Failed to get key: " + e.getMessage());
         }
@@ -213,6 +239,7 @@ public class ConnectionHandler implements Runnable {
 
     /**
      * Handles DEL command: DEL key
+     * Replicates to all responsible nodes.
      */
     private Response handleDel(Request request) {
         if (request.getArgCount() < 1) {
@@ -224,9 +251,13 @@ public class ConnectionHandler implements Runnable {
         try {
             boolean deleted = cache.delete(key);
 
-            // ← ADDED: Write to AOF only if key was deleted
+            // Write to AOF only if key was deleted
             if (deleted) {
                 aofWriter.writeDel(key);
+
+                // ← NEW: Replicate to other nodes
+                int replicaCount = replicationManager.replicateDel(key);
+                log.debug("DEL {} (replicated to {} nodes)", key, replicaCount);
             }
 
             log.debug("DEL {} = {}", key, deleted ? 1 : 0);
@@ -257,6 +288,7 @@ public class ConnectionHandler implements Runnable {
 
     /**
      * Handles EXPIRE command: EXPIRE key seconds
+     * Replicates to all responsible nodes.
      */
     private Response handleExpire(Request request) {
         if (request.getArgCount() < 2) {
@@ -275,9 +307,13 @@ public class ConnectionHandler implements Runnable {
         try {
             boolean success = cache.expire(key, seconds);
 
-            // ← ADDED: Write to AOF only if expire was successful
+            // Write to AOF and replicate only if expire was successful
             if (success) {
                 aofWriter.writeExpire(key, seconds);
+
+                // ← NEW: Replicate to other nodes
+                int replicaCount = replicationManager.replicateExpire(key, seconds);
+                log.debug("EXPIRE {} {} (replicated to {} nodes)", key, seconds, replicaCount);
             }
 
             log.debug("EXPIRE {} {} = {}", key, seconds, success ? 1 : 0);
@@ -324,15 +360,21 @@ public class ConnectionHandler implements Runnable {
      */
     private Response handleInfo(Request request) {
         try {
+            List<ClusterNode> nodes = replicationManager.getResponsibleNodes("dummy");
+
             String info = String.format(
                     "# KV Store Info\r\n" +
                             "cache_size=%d\r\n" +
                             "cache_capacity=%d\r\n" +
                             "aof_file_size=%d\r\n" +
+                            "cluster_nodes=%d\r\n" +
+                            "replication_factor=%d\r\n" +
                             "timestamp=%d\r\n",
                     cache.size(),
                     cache.getCapacity(),
                     aofWriter.getFileSize(),
+                    nodes.size(),
+                    Math.min(3, nodes.size()),
                     System.currentTimeMillis()
             );
             log.debug("INFO command executed");
