@@ -2,6 +2,7 @@ package com.kvstore.server;
 
 import com.kvstore.cache.LRUCache;
 import com.kvstore.cluster.ClusterNode;
+import com.kvstore.cluster.NodeSyncManager;
 import com.kvstore.cluster.ReplicationManager;
 import com.kvstore.persistence.AOFWriter;
 import com.kvstore.protocol.*;
@@ -17,6 +18,7 @@ import java.util.List;
  * Reads requests, executes commands, and sends responses.
  * Writes all write operations to AOF for durability.
  * Replicates writes to cluster replica nodes.
+ * Handles SYNC and REPLICATE commands for cluster recovery.
  */
 @Slf4j
 public class ConnectionHandler implements Runnable {
@@ -25,14 +27,17 @@ public class ConnectionHandler implements Runnable {
     private final LRUCache<String, String> cache;
     private final AOFWriter aofWriter;
     private final ReplicationManager replicationManager;
+    private final NodeSyncManager nodeSyncManager;
     private volatile boolean running = true;
 
     public ConnectionHandler(Socket socket, LRUCache<String, String> cache,
-                             AOFWriter aofWriter, ReplicationManager replicationManager) {
+                             AOFWriter aofWriter, ReplicationManager replicationManager,
+                             NodeSyncManager nodeSyncManager) {
         this.socket = socket;
         this.cache = cache;
         this.aofWriter = aofWriter;
         this.replicationManager = replicationManager;
+        this.nodeSyncManager = nodeSyncManager;
     }
 
     @Override
@@ -45,71 +50,91 @@ public class ConnectionHandler implements Runnable {
         try (InputStream in = socket.getInputStream();
              OutputStream out = socket.getOutputStream()) {
 
+            BufferedReader reader = new BufferedReader(new InputStreamReader(in, "UTF-8"));
+            String line;
+
             while (running && !Thread.currentThread().isInterrupted()) {
                 try {
-                    // Read request size (4 bytes)
-                    byte[] sizeBytes = new byte[4];
-                    int bytesRead = in.read(sizeBytes);
+                    line = reader.readLine();
 
-                    if (bytesRead == -1) {
-                        // Client closed connection
+                    if (line == null) {
                         log.info("Client disconnected: {}:{}", clientAddress, clientPort);
                         break;
                     }
 
-                    if (bytesRead < 4) {
-                        log.warn("Invalid request size header from {}:{}", clientAddress, clientPort);
+                    line = line.trim();
+                    if (line.isEmpty()) {
                         continue;
                     }
 
-                    int requestSize = readInt(sizeBytes);
+                    log.debug("Received: {} from {}:{}", line, clientAddress, clientPort);
 
-                    if (requestSize <= 0 || requestSize > 1_000_000) {  // Max 1MB request
-                        log.warn("Invalid request size {} from {}:{}", requestSize, clientAddress, clientPort);
-                        sendErrorResponse(out, "Invalid request size");
+                    Response response;
+
+                    // Handle REPLICATE commands (from replicas)
+                    if (line.startsWith("REPLICATE")) {
+                        response = handleReplicate(line);
+                    }
+                    // Handle SYNC commands (for recovery)
+                    else if (line.startsWith("SYNC")) {
+                        response = handleSync(out);
+                        out.flush();
                         continue;
                     }
+                    // Handle PING (for health checks)
+                    else if (line.startsWith("PING")) {
+                        response = Response.ok("PONG");
+                    }
+                    // Handle regular commands via binary protocol
+                    else {
+                        // For binary protocol commands, read request size first
+                        byte[] sizeBytes = new byte[4];
+                        int bytesRead = in.read(sizeBytes);
 
-                    // Read request data
-                    byte[] requestData = new byte[requestSize];
-                    int totalRead = 0;
-                    while (totalRead < requestSize) {
-                        int read = in.read(requestData, totalRead, requestSize - totalRead);
-                        if (read == -1) {
-                            log.warn("Client disconnected while reading request from {}:{}", clientAddress, clientPort);
+                        if (bytesRead < 4) {
+                            log.warn("Invalid request size header from {}:{}", clientAddress, clientPort);
+                            continue;
+                        }
+
+                        int requestSize = readInt(sizeBytes);
+
+                        if (requestSize <= 0 || requestSize > 1_000_000) {
+                            log.warn("Invalid request size {} from {}:{}", requestSize, clientAddress, clientPort);
+                            sendErrorResponse(out, "Invalid request size");
+                            continue;
+                        }
+
+                        byte[] requestData = new byte[requestSize];
+                        int totalRead = 0;
+                        while (totalRead < requestSize) {
+                            int read = in.read(requestData, totalRead, requestSize - totalRead);
+                            if (read == -1) {
+                                log.warn("Client disconnected while reading request from {}:{}", clientAddress, clientPort);
+                                break;
+                            }
+                            totalRead += read;
+                        }
+
+                        if (totalRead < requestSize) {
+                            log.warn("Incomplete request from {}:{}", clientAddress, clientPort);
                             break;
                         }
-                        totalRead += read;
-                    }
 
-                    if (totalRead < requestSize) {
-                        log.warn("Incomplete request from {}:{}", clientAddress, clientPort);
-                        break;
-                    }
-
-                    // Decode and process request
-                    try {
                         Request request = RequestDecoder.decode(requestData);
                         log.debug("Received command {} with {} args from {}:{}",
                                 request.getCommand(), request.getArgCount(), clientAddress, clientPort);
-
-                        Response response = processCommand(request);
-
-                        // Encode and send response
-                        byte[] responseData = ResponseEncoder.encode(response);
-                        byte[] sizeHeader = writeInt(responseData.length);
-
-                        out.write(sizeHeader);
-                        out.write(responseData);
-                        out.flush();
-
-                        log.debug("Sent response with status {} to {}:{}",
-                                response.getStatus(), clientAddress, clientPort);
-
-                    } catch (IOException e) {
-                        log.error("Error processing request from {}:{}", clientAddress, clientPort, e);
-                        sendErrorResponse(out, "Error processing request: " + e.getMessage());
+                        response = processCommand(request);
                     }
+
+                    // Send response
+                    byte[] responseData = ResponseEncoder.encode(response);
+                    byte[] sizeHeader = writeInt(responseData.length);
+
+                    out.write(sizeHeader);
+                    out.write(responseData);
+                    out.flush();
+
+                    log.debug("Sent response to {}:{}", clientAddress, clientPort);
 
                 } catch (IOException e) {
                     log.error("Connection error with {}:{}", clientAddress, clientPort, e);
@@ -118,13 +143,13 @@ public class ConnectionHandler implements Runnable {
             }
 
         } catch (IOException e) {
-            log.error("Socket error for {}:{}", clientAddress, clientPort, e);
+            log.error("Socket error", e);
         } finally {
             try {
                 socket.close();
                 log.info("Connection closed: {}:{}", clientAddress, clientPort);
             } catch (IOException e) {
-                log.error("Error closing socket for {}:{}", clientAddress, clientPort, e);
+                log.error("Error closing socket", e);
             }
         }
     }
@@ -184,20 +209,14 @@ public class ConnectionHandler implements Runnable {
         }
 
         try {
-            // Check if this node is responsible for this key
             ClusterNode primaryNode = replicationManager.getPrimaryNode(key);
 
             if (primaryNode != null) {
                 log.debug("Key {} primary node: {}", key, primaryNode.getId());
             }
 
-            // Write to local cache
             cache.put(key, value, expirySeconds);
-
-            // Write to AOF
             aofWriter.writeSet(key, value, expirySeconds);
-
-            // ← NEW: Replicate to other nodes
             int replicaCount = replicationManager.replicateSet(key, value, expirySeconds);
 
             log.debug("SET {} = {} (expiry: {} seconds, replicated to {} nodes)",
@@ -210,7 +229,6 @@ public class ConnectionHandler implements Runnable {
 
     /**
      * Handles GET command: GET key
-     * Reads from local cache or tries replicas if key not found locally.
      */
     private Response handleGet(Request request) {
         if (request.getArgCount() < 1) {
@@ -220,7 +238,6 @@ public class ConnectionHandler implements Runnable {
         String key = request.getArg(0);
 
         try {
-            // Try to get from local cache first
             String value = cache.get(key);
 
             if (value != null) {
@@ -228,8 +245,6 @@ public class ConnectionHandler implements Runnable {
                 return Response.bulkString(value);
             }
 
-            // ← NEW: If not in local cache, we could try replicas
-            // For now, just return nil (in full clustering, we'd query replicas)
             log.debug("GET {} = nil", key);
             return Response.nil();
         } catch (Exception e) {
@@ -239,7 +254,6 @@ public class ConnectionHandler implements Runnable {
 
     /**
      * Handles DEL command: DEL key
-     * Replicates to all responsible nodes.
      */
     private Response handleDel(Request request) {
         if (request.getArgCount() < 1) {
@@ -251,11 +265,8 @@ public class ConnectionHandler implements Runnable {
         try {
             boolean deleted = cache.delete(key);
 
-            // Write to AOF only if key was deleted
             if (deleted) {
                 aofWriter.writeDel(key);
-
-                // ← NEW: Replicate to other nodes
                 int replicaCount = replicationManager.replicateDel(key);
                 log.debug("DEL {} (replicated to {} nodes)", key, replicaCount);
             }
@@ -288,7 +299,6 @@ public class ConnectionHandler implements Runnable {
 
     /**
      * Handles EXPIRE command: EXPIRE key seconds
-     * Replicates to all responsible nodes.
      */
     private Response handleExpire(Request request) {
         if (request.getArgCount() < 2) {
@@ -307,11 +317,8 @@ public class ConnectionHandler implements Runnable {
         try {
             boolean success = cache.expire(key, seconds);
 
-            // Write to AOF and replicate only if expire was successful
             if (success) {
                 aofWriter.writeExpire(key, seconds);
-
-                // ← NEW: Replicate to other nodes
                 int replicaCount = replicationManager.replicateExpire(key, seconds);
                 log.debug("EXPIRE {} {} (replicated to {} nodes)", key, seconds, replicaCount);
             }
@@ -381,6 +388,86 @@ public class ConnectionHandler implements Runnable {
             return Response.bulkString(info);
         } catch (Exception e) {
             return Response.error("Failed to get info: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Handles SYNC command: returns all data in cache for recovery.
+     */
+    private Response handleSync(OutputStream out) {
+        try {
+            log.info("SYNC command received, sending cache data");
+            nodeSyncManager.sendSyncData(out);
+            return Response.ok("SYNC_COMPLETE");
+        } catch (Exception e) {
+            log.error("Failed to handle SYNC command", e);
+            return Response.error("Failed to sync: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Handles REPLICATE command from replica nodes.
+     * Format: REPLICATE SET key value [seconds] or REPLICATE DEL key
+     */
+    private Response handleReplicate(String line) {
+        try {
+            String[] parts = line.split("\\s+");
+
+            if (parts.length < 2) {
+                return Response.error("Invalid REPLICATE command");
+            }
+
+            String command = parts[1].toUpperCase();
+
+            switch (command) {
+                case "SET":
+                    if (parts.length >= 4) {
+                        String key = parts[2];
+                        String value = parts[3];
+                        long expirySeconds = -1;
+
+                        if (parts.length > 4) {
+                            try {
+                                expirySeconds = Long.parseLong(parts[4]);
+                            } catch (NumberFormatException e) {
+                                // Ignore
+                            }
+                        }
+
+                        cache.put(key, value, expirySeconds);
+                        aofWriter.writeSet(key, value, expirySeconds);
+                        log.debug("Replicated SET {} = {}", key, value);
+                        return Response.ok();
+                    }
+                    return Response.error("Invalid REPLICATE SET");
+
+                case "DEL":
+                    if (parts.length >= 3) {
+                        String key = parts[2];
+                        cache.delete(key);
+                        aofWriter.writeDel(key);
+                        log.debug("Replicated DEL {}", key);
+                        return Response.ok();
+                    }
+                    return Response.error("Invalid REPLICATE DEL");
+
+                case "EXPIRE":
+                    if (parts.length >= 4) {
+                        String key = parts[2];
+                        long seconds = Long.parseLong(parts[3]);
+                        cache.expire(key, seconds);
+                        aofWriter.writeExpire(key, seconds);
+                        log.debug("Replicated EXPIRE {} {}", key, seconds);
+                        return Response.ok();
+                    }
+                    return Response.error("Invalid REPLICATE EXPIRE");
+
+                default:
+                    return Response.error("Unknown REPLICATE command: " + command);
+            }
+        } catch (Exception e) {
+            log.error("Error handling REPLICATE command", e);
+            return Response.error("REPLICATE error: " + e.getMessage());
         }
     }
 
