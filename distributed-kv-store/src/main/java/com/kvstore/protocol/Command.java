@@ -12,8 +12,8 @@ public enum Command {
     TTL(6, "TTL key"),
     PING(7, "PING"),
     FLUSHALL(8, "FLUSHALL"),
-    INFO(9, "INFO");
-
+    INFO(9, "INFO"),
+    SYNC(10,"SYNC");
     public final int code;
     public final String description;
 

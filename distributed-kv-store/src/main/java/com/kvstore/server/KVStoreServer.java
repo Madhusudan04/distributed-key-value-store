@@ -1,6 +1,7 @@
 package com.kvstore.server;
 
 import com.kvstore.cache.LRUCache;
+import com.kvstore.cluster.NodeSyncManager;
 import com.kvstore.cluster.ReplicationManager;
 import com.kvstore.persistence.AOFWriter;
 import lombok.extern.slf4j.Slf4j;
@@ -20,7 +21,7 @@ import java.util.concurrent.TimeUnit;
  * TCP Server for KV Store.
  * Listens on a specified port and accepts client connections.
  * Uses a thread pool to handle multiple clients concurrently.
- * Integrates with cluster replication manager.
+ * Integrates with cluster replication and sync managers.
  */
 @Slf4j
 @Component
@@ -31,6 +32,7 @@ public class KVStoreServer {
     private final LRUCache<String, String> cache;
     private final AOFWriter aofWriter;
     private final ReplicationManager replicationManager;
+    private final NodeSyncManager nodeSyncManager;
 
     private ServerSocket serverSocket;
     private ExecutorService executorService;
@@ -42,12 +44,14 @@ public class KVStoreServer {
             @Value("${kvstore.server.thread-pool-size:10}") int threadPoolSize,
             LRUCache<String, String> cache,
             AOFWriter aofWriter,
-            ReplicationManager replicationManager) {
+            ReplicationManager replicationManager,
+            NodeSyncManager nodeSyncManager) {
         this.port = port;
         this.threadPoolSize = threadPoolSize;
         this.cache = cache;
         this.aofWriter = aofWriter;
         this.replicationManager = replicationManager;
+        this.nodeSyncManager = nodeSyncManager;
     }
 
     /**
@@ -86,8 +90,8 @@ public class KVStoreServer {
                         clientSocket.getInetAddress().getHostAddress(),
                         clientSocket.getPort());
 
-                // Handle client in thread pool
-                ConnectionHandler handler = new ConnectionHandler(clientSocket, cache, aofWriter, replicationManager);
+                ConnectionHandler handler = new ConnectionHandler(clientSocket, cache, aofWriter,
+                        replicationManager, nodeSyncManager);
                 executorService.submit(handler);
 
             } catch (IOException e) {
